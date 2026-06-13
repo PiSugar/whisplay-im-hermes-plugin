@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "http://127.0.0.1:18888"
 DEFAULT_CHAT_ID = "whisplay-device"
 MAX_MESSAGE_LENGTH = 8192
+DEFAULT_RECONNECT_SEC = 10.0
 
 
 def _headers(token: str) -> Dict[str, str]:
@@ -83,9 +84,13 @@ class WhisplayIMAdapter(BasePlatformAdapter):
         self._send_path = extra.get("send_path") or os.getenv("WHISPLAY_IM_SEND_PATH", "/whisplay-im/send")
         self._status_path = extra.get("status_path") or os.getenv("WHISPLAY_IM_STATUS_PATH", "/whisplay-im/status")
         self._wait_sec = int(extra.get("wait_sec") or os.getenv("WHISPLAY_IM_WAIT_SEC", "30"))
+        self._reconnect_sec = float(
+            extra.get("reconnect_sec") or os.getenv("WHISPLAY_IM_RECONNECT_SEC", str(DEFAULT_RECONNECT_SEC))
+        )
         self._client: Optional["httpx.AsyncClient"] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._seen_ids: set[str] = set()
+        self._bridge_connected = False
 
     async def connect(self) -> bool:
         if not HTTPX_AVAILABLE:
@@ -94,8 +99,7 @@ class WhisplayIMAdapter(BasePlatformAdapter):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._wait_sec + 10.0, connect=5.0))
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
-        self._mark_connected()
-        logger.info("[whisplay-im] Connected to %s", self._base_url)
+        logger.info("[whisplay-im] Connecting to %s", self._base_url)
         return True
 
     async def disconnect(self) -> None:
@@ -110,6 +114,7 @@ class WhisplayIMAdapter(BasePlatformAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+        self._bridge_connected = False
         self._mark_disconnected()
         logger.info("[whisplay-im] Disconnected")
 
@@ -120,9 +125,13 @@ class WhisplayIMAdapter(BasePlatformAdapter):
             try:
                 resp = await self._client.get(
                     f"{self._base_url}{self._poll_path}",
-                    params={"waitSec": self._wait_sec},
+                    params={"waitSec": self._wait_sec if self._bridge_connected else 0},
                     headers=_headers(self._token),
                 )
+                if not self._bridge_connected:
+                    self._bridge_connected = True
+                    self._mark_connected()
+                    logger.info("[whisplay-im] Connected to %s", self._base_url)
                 if resp.status_code == 204:
                     backoff = 1.0
                     continue
@@ -136,9 +145,19 @@ class WhisplayIMAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("[whisplay-im] poll failed: %s", exc)
-                await asyncio.sleep(min(backoff, 30.0))
-                backoff = min(backoff * 2, 30.0)
+                if self._bridge_connected:
+                    self._bridge_connected = False
+                    self._mark_disconnected()
+                    logger.warning("[whisplay-im] disconnected from %s: %s", self._base_url, exc)
+                else:
+                    logger.warning(
+                        "[whisplay-im] cannot connect to %s: %s; retrying in %.1fs",
+                        self._base_url,
+                        exc,
+                        self._reconnect_sec,
+                    )
+                await asyncio.sleep(self._reconnect_sec)
+                backoff = 1.0
 
     async def _handle_payload(self, data: dict) -> None:
         text = (data.get("message") or data.get("text") or "").strip()
@@ -182,7 +201,7 @@ class WhisplayIMAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._client:
+        if not self._client or not self._bridge_connected:
             return SendResult(success=False, error="whisplay-im is not connected", retryable=True)
         body = {"reply": (content or "")[:MAX_MESSAGE_LENGTH], "emoji": "🙂"}
         try:
@@ -209,7 +228,7 @@ class WhisplayIMAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc), retryable=True)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        if not self._client:
+        if not self._client or not self._bridge_connected:
             return
         try:
             await self._client.post(

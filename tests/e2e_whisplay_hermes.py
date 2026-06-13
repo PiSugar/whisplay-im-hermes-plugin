@@ -126,12 +126,8 @@ def main() -> int:
     marker = f"{args.message} id={test_id}"
 
     hermes_active = service_active("hermes-gateway.service")
-    chatbot_active = service_active("chatbot.service")
     if hermes_active is False:
         print("FAIL hermes-gateway.service is not active", file=sys.stderr)
-        return 2
-    if chatbot_active is False:
-        print("FAIL chatbot.service is not active", file=sys.stderr)
         return 2
 
     poll_url = f"{base_url}/whisplay-im/poll?waitSec=1"

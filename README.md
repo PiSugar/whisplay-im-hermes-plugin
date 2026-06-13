@@ -24,6 +24,7 @@ Configure Hermes secrets in `~/.hermes/.env`:
 WHISPLAY_IM_BASE_URL=http://127.0.0.1:18888
 WHISPLAY_IM_CHAT_ID=whisplay-device
 WHISPLAY_IM_ALLOW_ALL_USERS=true
+# WHISPLAY_IM_RECONNECT_SEC=10
 # WHISPLAY_IM_TOKEN=optional-shared-token
 ```
 
@@ -32,6 +33,10 @@ Restart the gateway:
 ```bash
 sudo systemctl restart hermes-gateway.service
 ```
+
+The plugin does not require the Whisplay IM bridge to be online before Hermes
+starts. If `WHISPLAY_IM_BASE_URL` is unavailable, it keeps retrying every
+`WHISPLAY_IM_RECONNECT_SEC` seconds until the bridge comes up.
 
 ## Hermes Model Example
 
@@ -58,11 +63,10 @@ Run this on the Raspberry Pi after Hermes Gateway and whisplay-ai-chatbot are ru
 python3 tests/e2e_whisplay_hermes.py
 ```
 
-The test posts a unique message to `/whisplay-im/inbox`, watches `~/.hermes/logs/gateway.log`, and passes when Hermes receives the message and attempts to deliver a response through the `whisplay_im` platform.
+The test posts a unique message to `/whisplay-im/inbox`, watches `~/.hermes/logs/gateway.log`, and passes when Hermes receives the message and attempts to deliver a response through the `whisplay_im` platform. It only requires `hermes-gateway.service` and the Whisplay IM bridge endpoint to be available; `chatbot.service` does not need to exist or be active when the bridge is launched by `whisplay-daemon`.
 
 If you want the test to fail when the model provider/API key is not configured, use:
 
 ```bash
 python3 tests/e2e_whisplay_hermes.py --require-real-response
 ```
-
