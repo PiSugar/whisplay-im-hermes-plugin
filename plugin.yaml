@@ -1,0 +1,24 @@
+name: whisplay-im
+label: Whisplay IM
+kind: platform
+version: 0.1.0
+description: Hermes gateway adapter for the Whisplay IM bridge exposed by whisplay-ai-chatbot.
+author: PiSugar
+requires_env:
+  - name: WHISPLAY_IM_BASE_URL
+    description: Whisplay IM bridge base URL, e.g. http://127.0.0.1:18888
+    prompt: Whisplay IM base URL
+    password: false
+optional_env:
+  - name: WHISPLAY_IM_TOKEN
+    description: Bearer token shared with the Whisplay chatbot bridge, if enabled
+    prompt: Whisplay IM token
+    password: true
+  - name: WHISPLAY_IM_CHAT_ID
+    description: Stable chat/session id used by Hermes for Whisplay device messages
+    prompt: Whisplay IM chat id
+    password: false
+  - name: WHISPLAY_IM_ALLOW_ALL_USERS
+    description: Allow the Whisplay device channel to talk to Hermes
+    prompt: Allow all Whisplay users? (true/false)
+    password: false
