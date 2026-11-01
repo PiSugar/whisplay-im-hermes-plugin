@@ -16,6 +16,19 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
+try:
+    # Profile-scoped env read: a multiplexing gateway keeps secondary-profile .env values in a
+    # secret scope, not os.environ, so a bare os.getenv() misses them.
+    from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+except ImportError:  # older Hermes without profile multiplexing
+    _get_scoped_secret = None
+
+
+def _env(name: str, default: Any = None) -> Any:
+    if _get_scoped_secret is not None:
+        return _get_scoped_secret(name, default)
+    return os.environ.get(name, default)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18888"
@@ -36,11 +49,11 @@ def _extra(config: PlatformConfig) -> dict:
 
 
 def _base_url_from(extra: dict) -> str:
-    return (extra.get("base_url") or os.getenv("WHISPLAY_IM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+    return (extra.get("base_url") or _env("WHISPLAY_IM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
 
 
 def _token_from(extra: dict) -> str:
-    return extra.get("token") or os.getenv("WHISPLAY_IM_TOKEN", "")
+    return extra.get("token") or _env("WHISPLAY_IM_TOKEN", "")
 
 
 def check_requirements() -> bool:
@@ -56,16 +69,16 @@ def is_connected(config) -> bool:
 
 
 def _env_enablement() -> dict | None:
-    base_url = os.getenv("WHISPLAY_IM_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
+    base_url = _env("WHISPLAY_IM_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
     if not base_url:
         return None
-    chat_id = os.getenv("WHISPLAY_IM_CHAT_ID", DEFAULT_CHAT_ID).strip() or DEFAULT_CHAT_ID
+    chat_id = _env("WHISPLAY_IM_CHAT_ID", DEFAULT_CHAT_ID).strip() or DEFAULT_CHAT_ID
     seed: dict[str, Any] = {
         "base_url": base_url,
         "chat_id": chat_id,
         "home_channel": {"chat_id": chat_id, "name": "Whisplay"},
     }
-    token = os.getenv("WHISPLAY_IM_TOKEN", "").strip()
+    token = _env("WHISPLAY_IM_TOKEN", "").strip()
     if token:
         seed["token"] = token
     return seed
@@ -79,49 +92,66 @@ class WhisplayIMAdapter(BasePlatformAdapter):
         extra = _extra(config)
         self._base_url = _base_url_from(extra)
         self._token = _token_from(extra)
-        self._chat_id = extra.get("chat_id") or os.getenv("WHISPLAY_IM_CHAT_ID", DEFAULT_CHAT_ID)
-        self._poll_path = extra.get("poll_path") or os.getenv("WHISPLAY_IM_POLL_PATH", "/whisplay-im/poll")
-        self._send_path = extra.get("send_path") or os.getenv("WHISPLAY_IM_SEND_PATH", "/whisplay-im/send")
-        self._status_path = extra.get("status_path") or os.getenv("WHISPLAY_IM_STATUS_PATH", "/whisplay-im/status")
-        self._wait_sec = int(extra.get("wait_sec") or os.getenv("WHISPLAY_IM_WAIT_SEC", "30"))
+        self._chat_id = extra.get("chat_id") or _env("WHISPLAY_IM_CHAT_ID", DEFAULT_CHAT_ID)
+        self._poll_path = extra.get("poll_path") or _env("WHISPLAY_IM_POLL_PATH", "/whisplay-im/poll")
+        self._send_path = extra.get("send_path") or _env("WHISPLAY_IM_SEND_PATH", "/whisplay-im/send")
+        self._status_path = extra.get("status_path") or _env("WHISPLAY_IM_STATUS_PATH", "/whisplay-im/status")
+        self._wait_sec = int(extra.get("wait_sec") or _env("WHISPLAY_IM_WAIT_SEC", "30"))
         self._reconnect_sec = float(
-            extra.get("reconnect_sec") or os.getenv("WHISPLAY_IM_RECONNECT_SEC", str(DEFAULT_RECONNECT_SEC))
+            extra.get("reconnect_sec") or _env("WHISPLAY_IM_RECONNECT_SEC", str(DEFAULT_RECONNECT_SEC))
         )
         self._client: Optional["httpx.AsyncClient"] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
+        # Poller lifetime is independent of BasePlatformAdapter._running, which
+        # reports whether the bridge is connected, not whether we should retry.
+        self._polling = False
         self._seen_ids: set[str] = set()
         self._bridge_connected = False
 
-    async def connect(self) -> bool:
-        if not HTTPX_AVAILABLE:
+    @property
+    def send_path_degraded(self) -> bool:
+        """Keep runner startup/reconnect status truthful until the bridge responds."""
+        return self._polling and not self._bridge_connected
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if not HTTPX_AVAILABLE or httpx is None:
             logger.warning("[whisplay-im] httpx is not installed")
             return False
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._wait_sec + 10.0, connect=5.0))
-        self._running = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info("[whisplay-im] Connecting to %s", self._base_url)
+        async with self._lifecycle_lock:
+            if self._poll_task is not None and not self._poll_task.done():
+                return True
+            if self._client is not None:
+                await self._client.aclose()
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._wait_sec + 10.0, connect=5.0))
+            self._bridge_connected = False
+            self._mark_disconnected()
+            self._polling = True
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            logger.info("[whisplay-im] Connecting to %s", self._base_url)
         return True
 
     async def disconnect(self) -> None:
-        self._running = False
-        if self._poll_task:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-        self._bridge_connected = False
-        self._mark_disconnected()
-        logger.info("[whisplay-im] Disconnected")
+        async with self._lifecycle_lock:
+            self._polling = False
+            self._bridge_connected = False
+            self._mark_disconnected()
+            if self._poll_task:
+                self._poll_task.cancel()
+                try:
+                    await self._poll_task
+                except asyncio.CancelledError:
+                    pass
+                self._poll_task = None
+            if self._client:
+                await self._client.aclose()
+                self._client = None
+            logger.info("[whisplay-im] Disconnected")
 
     async def _poll_loop(self) -> None:
         assert self._client is not None
         backoff = 1.0
-        while self._running:
+        while self._polling:
             try:
                 resp = await self._client.get(
                     f"{self._base_url}{self._poll_path}",

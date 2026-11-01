@@ -55,6 +55,30 @@ sudo systemctl restart hermes-gateway.service
 - `adapter.py` implements polling, sending, and status updates for Whisplay IM.
 - `__init__.py` exposes the Hermes `register(ctx)` entry point.
 
+## Adapter regression tests (no device or gateway required)
+
+The unit suite uses the selected Hermes source tree's real adapter base and
+secret-scope implementation, with HTTPX MockTransport simulating bridge I/O.
+It covers failure/recovery, cancellation during polling and backoff, concurrent
+start/stop, scoped configuration, and the simulated legacy import fallback.
+The tests require Hermes v0.21.6 or later; a skipped test is not compatibility
+evidence. No model calls or real credentials are needed.
+
+Run in a disposable environment with Hermes' import dependencies and `httpx`
+available. Set `HERMES_AGENT_DIR` to the source snapshot being tested and
+`HERMES_HOME` to an empty disposable directory: the real base adapter writes
+runtime status there. Do not point the test suite at a live gateway's home.
+
+```bash
+HERMES_AGENT_DIR=/path/to/hermes-source \
+HERMES_HOME=/path/to/disposable-test-home \
+python -m unittest discover -s tests -v
+```
+
+This is adapter-level compatibility coverage, not a full gateway/device E2E
+test. The pre-existing handling of non-success HTTP poll responses is separate
+from the network-failure/reconnect lifecycle covered by this change.
+
 ## Automated E2E Test
 
 Run this on the Raspberry Pi after Hermes Gateway and whisplay-ai-chatbot are running:
